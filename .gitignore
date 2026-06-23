@@ -1,15 +1,15 @@
-# Secrets: never commit API keys
+# Secrets
 .env
 *.env
 
-# Resume PDFs (student data, not for version control)
+# Resume PDFs 
 resumes/
 *.pdf
 
 # Generated outputs
 output/
 
-# Data files (student and company CSVs)
+# Data files (inputs)
 *.csv
 
 # Python cruft
