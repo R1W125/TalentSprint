@@ -1,0 +1,370 @@
+# Talent Sprint Matching Pipeline: How It Works
+
+This document explains every file in the project, what it does, and how the
+files work together. It is written to be read top to bottom. Read the "Big
+picture" section first, then the per-file sections.
+
+---
+
+## 1. Big picture: what the program does
+
+The Talent Sprint is like a career fair, except every student is assigned to
+exactly one company for a 10 minute interview, and every company gets up to a
+fixed number of students (10 by default). The program decides who goes where.
+
+It does this in five steps, run in order by `main.py`:
+
+```
+   PDFs + 2 CSV files
+          |
+   (1) parse_resumes.py   read each resume PDF into plain text
+          |
+   (2) load_data.py       turn the CSVs into clean tables, attach resumes
+          |
+   (3) score.py           ask Gemini AI to rate each student 0-100 per company
+          |                then apply the work authorization rule in code
+          |
+   (4) match.py           combine AI scores with student preferences,
+          |                then run the matching algorithm
+          |
+   (5) main.py            write matches.csv + waitlist.csv, print a summary
+```
+
+Two ideas drive the whole thing:
+
+1. **Fit score (from AI):** how well a student matches a company's needs.
+2. **Preference score (from the student):** how much the student wanted that
+   company, based on their ranked choices.
+
+These are blended into one **combined score** that the matching algorithm uses:
+
+```
+combined = 0.7 * fit_score + 0.3 * preference_score
+```
+
+The weights (0.7 and 0.3) live in `config.py` so they are easy to change.
+
+---
+
+## 2. The files, one by one
+
+### `config.py`  (the control panel)
+
+This file holds every setting in one place. Nothing here "does" anything on its
+own; the other files read values from it. Keeping settings here means you can
+retune the system without touching the logic.
+
+What it defines:
+
+- **Paths** to the data folder, the output folder, and the `.env` file. They are
+  built relative to the file's own location, so the program runs correctly no
+  matter which folder you launch it from.
+- **Matching weights and capacity:** `FIT_WEIGHT = 0.7`, `PREFERENCE_WEIGHT =
+  0.3`, `SLOTS_PER_COMPANY = 10`.
+- **`PRIORITY_COMPANIES`:** an optional list of companies that get first pick
+  (explained under `match.py`). Currently set to `["IBM", "Enlaye"]`. An empty
+  list `[]` means all companies are treated equally.
+- **`PREFERENCE_SCORE_MAP`:** converts a student's rank into points. Rank 1 =
+  100, rank 2 = 85, and so on down to rank 6 = 35. A company a student did not
+  rank gets `UNRANKED_PREFERENCE_SCORE = 10`. Higher rank means more points,
+  which pushes the combined score up.
+- **`CRITERIA_WEIGHTS`:** the percentages the AI is told to use when scoring
+  (technical skills 35%, experience 15%, project relevance 35%, soft skills
+  15%). These appear only inside the text we send to the AI.
+- **Gemini settings:** the default model name, the rate limit settings (how long
+  to wait between AI calls, how many times to retry), and
+  `STUDENTS_PER_SCORING_BATCH` (how many students go in one scoring prompt).
+- **Column mappings (`STUDENT_COLS`, `COMPANY_COLS`):** the most important
+  practical part. Google Forms produces very long, messy column headers. These
+  dictionaries map a short internal name (like `bu_email`) to the exact header
+  string in the CSV (like `"BU Email"`). If a form question is reworded later,
+  you only edit it here and nothing else breaks.
+
+Key detail: the companies CSV from Google had a broken first header (it showed a
+company name instead of "Company Name") and no Timestamp column. The mappings
+and `load_data.py` handle that quirk so the rest of the code sees clean data.
+
+---
+
+### `parse_resumes.py`  (PDF to text)
+
+Job: turn each resume PDF into plain text the AI can read.
+
+How it works:
+
+- It looks in `data/resumes/` and opens every `.pdf` using the `pdfplumber`
+  library, extracting the text from each page.
+- It does **light cleaning only**: collapse repeated spaces and blank lines,
+  trim the ends. It deliberately does not try to restructure the resume, because
+  guessing at layout often makes things worse.
+- **Linking resumes to students:** the upload system renames each resume to the
+  student's BU email, for example `alex.chen@bu.edu.pdf`. So the program takes
+  the filename, removes `.pdf`, lowercases it, and treats that as the student's
+  email. This is why **BU Email is the single ID used everywhere**.
+- **Defensive behavior (so one bad file never stops the run):**
+  - If a filename is not a valid email (for example `student1_alex.pdf`), it is
+    logged and added to an `unmatched_resume_files` list instead of crashing.
+  - If a PDF is corrupted and cannot be opened, its text becomes an empty string
+    and the run continues.
+
+Output: a dictionary mapping `email -> resume_text`, plus the list of unmatched
+files.
+
+Important normalization rule: emails are always lowercased and stripped of
+spaces on both sides (the filename side and the CSV side), so they always match.
+
+---
+
+### `load_data.py`  (CSVs to clean tables)
+
+Job: read the two CSV files and produce two clean tables (pandas DataFrames),
+one for students and one for companies, and attach each student's resume text.
+
+For **students** it builds columns: name, email (BU Email, the unique ID),
+`needs_sponsorship` (True if they answered "No" to "are you authorized to
+work"), preferred work type, years of experience, environment, their project
+paragraph, their "what I am looking for" paragraph, the resume text, and a
+dictionary of their ranked company choices like `{"IBM": 3, "Draper": 1}`.
+
+For **companies** it builds columns: name, contact, roles, required skills,
+preferred experience level, job description text, ideal candidate notes, and
+`sponsors` (True if they answered "Yes" to sponsoring work authorization).
+
+Three details worth understanding:
+
+1. **The join key is BU Email.** Google also auto-collects an "Email Address"
+   field, but we deliberately ignore that one and join on the BU Email the
+   student typed, because that is what the resume files are named after.
+
+2. **Fuzzy company name matching (`_norm_company_key`).** The student form lists
+   a company as "PJMF" but the company form calls it "PJMF (Patrick J. McGovern
+   Foundation)". To make these match, the code normalizes names by lowercasing,
+   removing anything in parentheses, and collapsing spaces. So "PJMF" and "PJMF
+   (Patrick J. McGovern Foundation)" both reduce to "pjmf" and are treated as
+   the same company. This same normalization is reused by the matching and
+   priority code.
+
+3. **`preference_score(student, company)` and `preference_rank(...)`.** These
+   look up how a student ranked a company (using the fuzzy matching above) and
+   return either the points from the preference map or the unranked default of
+   10. The matcher calls these.
+
+Finally, `validate_and_report(...)` prints sanity checks: how many students and
+companies loaded, any company in a "Choices [...]" column that has no matching
+company in the companies file (and the reverse), and which students are missing
+a resume. This is how you catch data problems before trusting the results.
+
+---
+
+### `score.py`  (AI fit scoring + the work authorization rule + caching)
+
+Job: produce a fit score from 0 to 100 for every student/company pair. This is
+the only file that talks to the Gemini AI.
+
+How the scoring works:
+
+- **Scored per company, in student batches.** For each company the code asks the
+  AI to score the students and return a JSON list with one score per student.
+  Doing it per company (instead of one call per student/company pair) keeps the
+  number of calls small and lets the AI compare students against each other.
+  Within a company the students are split into batches of
+  `STUDENTS_PER_SCORING_BATCH` (default 30, set in `config.py`). Batching matters
+  at the real event scale: putting 150 to 200 full resumes into a single prompt
+  would risk the context limit, dilute scoring quality, and make one malformed
+  reply force everyone to be re-scored. Small batches keep each prompt focused.
+  With a cohort smaller than the batch size, it is just one call per company.
+- **Students are numbered, not named, in the answer.** The prompt asks the AI to
+  return `{"student": 1, "score": 78, ...}` rather than using names, to reduce
+  the chance the AI is biased by a name.
+- **The prompt is ordered for caching.** The instructions and the student block
+  come first; the company specific block comes last. For a given batch of
+  students that leading section is identical no matter which company is being
+  scored, so it forms a stable prefix that Gemini's prefix caching can reuse
+  across all companies, instead of re-reading every resume once per company.
+- **The prompt tells the AI how to score:** the criteria weights, a 0-100
+  guideline scale, and instructions to reward concrete projects over buzzwords
+  and not to penalize missing information.
+
+Robustness (because AI output is not always clean):
+
+- It strips any Markdown code fences (` ``` `) before reading the JSON.
+- If the JSON fails to parse, or the number of scores does not match the number
+  of students in the batch, it retries that batch up to 2 more times, then fails
+  loudly with a clear message rather than guessing.
+- Every score is clamped into the 0 to 100 range.
+
+**The work authorization HARD FILTER (this part is in code, not in the prompt).**
+After the AI returns its scores, the code checks each pair: if the student needs
+sponsorship and the company does not sponsor, it overwrites that fit score with
+0 and records the reason "Hard filter: requires sponsorship, company does not
+sponsor." This is done in Python on purpose, so it is a guaranteed rule and not
+something the AI might apply inconsistently. Importantly, the matcher also treats
+these pairs as forbidden so they can never be assigned (see `match.py`); zeroing
+the fit score is only the visible, audit-friendly half of the rule.
+
+**Caching and resuming (this protects your API budget):**
+
+- All results are written to `output/scores.csv` with columns: student name,
+  student email, company name, fit score, reason.
+- The file is saved after **every company**, not just at the end. So if the run
+  crashes at company 15 of 17, the first 14 are already saved.
+- On the next run, any company already in the cache is skipped. Re-running never
+  repeats a paid AI call. To force a fresh run, pass `--rescore`.
+
+**Rate limiting:** the Gemini free tier allows only about 15 requests per
+minute. Because batching means several calls per company, the code paces *every*
+API call centrally so any two calls are at least a few seconds apart, and if it
+still hits a "429 quota" error it reads the suggested wait time and pauses
+instead of failing.
+
+---
+
+### `match.py`  (combine scores, then run the matching algorithm)
+
+Job: turn all the scores and preferences into a final assignment.
+
+Step 1: **Build the combined score** for every student/company pair:
+
+```
+combined = 0.7 * fit_score + 0.3 * preference_score
+```
+
+So a student ranks high for a company when both the AI likes the fit and the
+student wanted that company.
+
+While building these scores the code also collects the set of **forbidden
+pairs**: any (student, company) where the student needs sponsorship and the
+company does not sponsor. This is the enforced half of the work authorization
+hard filter. The matcher removes forbidden pairs from every company's wish list,
+so such a pair can never be assigned. (Zeroing the fit score alone was not
+enough, because the preference component could still pull a forbidden pair into
+a match when seats are scarce.)
+
+Step 2: **Run company-proposing Gale-Shapley with capacity.** This is the
+classic stable matching algorithm. In plain terms:
+
+1. Each company makes a wish list of its eligible students (forbidden pairs
+   excluded), sorted by combined score (best first).
+2. Companies "propose" to their top students.
+3. A student can hold only one offer at a time. If two companies want the same
+   student, the student keeps whichever offer has the higher combined score and
+   rejects the other.
+4. A rejected company moves down its list and proposes to its next choice.
+5. This repeats until every company has either filled its slots (10 by default)
+   or run out of students to ask.
+
+Why this algorithm: the result is **stable**. That means there is no
+student/company pair who would both rather be with each other than with who they
+ended up with. Stability is the standard fairness guarantee for this kind of
+"two sided" matching, and Gale-Shapley provably produces it. (This is the same
+family of algorithm used for matching medical residents to hospitals.)
+
+Step 3: **The waitlist.** Any student who holds no offer at the end is put on
+the waitlist, sorted by their single best combined score across the companies
+they are eligible for, so the strongest near-misses are listed first. Forbidden
+companies are skipped here too; a student for whom every company is forbidden is
+listed with "none eligible".
+
+**Priority (`run_priority_match`, the optional two round mode).** Normal
+Gale-Shapley treats all companies as equal, and the order does not affect the
+result. To let some companies genuinely get first pick, the code can run the
+matcher in two rounds:
+
+- Round 1: only the companies in `PRIORITY_COMPANIES` (currently IBM and Enlaye)
+  match, against the full student pool. They lock in their picks first.
+- Round 2: every other company matches, but only over the students who were not
+  taken in round 1.
+
+If `PRIORITY_COMPANIES` is empty, this collapses back to a single normal round,
+so the feature is fully opt in and the default behavior is unchanged.
+
+---
+
+### `main.py`  (the conductor)
+
+Job: run the five steps in order and report the results. It contains no matching
+logic itself; it just calls the other files and prints a summary.
+
+In order, it:
+
+1. Calls `parse_resumes()` to read the PDFs.
+2. Calls `load_students()` and `load_companies()`, then `validate_and_report()`.
+3. Calls `score_all()` (uses the cache, or calls the AI with `--rescore`).
+4. Calls `run_priority_match()` to produce the matches and waitlist.
+5. Writes `matches.csv` and `waitlist.csv`, then prints the summary report.
+
+The **summary report** shows: total students, total matched, total waitlisted;
+per company how many seats were filled and the average fit of its matched
+students; how many students got their 1st, 2nd, 3rd, lower, or an unranked
+choice; which students were zeroed by the sponsorship rule; which students were
+missing resumes; and a note for any company that did not fill all its seats.
+
+Output files it produces in `output/`:
+
+- **`matches.csv`:** the final answer. One row per matched student with their
+  company, fit score, the rank they gave that company, the combined score, and
+  the AI's one line reason.
+- **`waitlist.csv`:** unmatched students with their best near-miss company and
+  scores.
+- **`scores.csv`:** the full AI score sheet (also the cache).
+
+---
+
+## 3. Supporting files
+
+- **`.env`:** holds your secret `GEMINI_API_KEY` and the `GEMINI_MODEL` name.
+  Kept out of the code so the key is not hard coded.
+- **`requirements.txt`:** the list of Python libraries to install
+  (`pandas`, `pdfplumber`, `python-dotenv`, `google-genai`).
+- **`data/`:** inputs. `students.csv`, `companies.csv`, and the `resumes/`
+  folder of PDFs.
+- **`output/`:** the three generated CSV files.
+
+### Test files (in the project root, outside `talent_sprint/`)
+
+These reuse the cached scores and make **no AI calls**. They exist to prove the
+matching logic behaves correctly on small, easy to read setups.
+
+- **`test_waitlist_2companies.py`:** 2 companies, 5 seats each, all 16 students.
+  That is 10 seats for 16 students, so 6 must be waitlisted. It checks the
+  matcher and the waitlist ordering.
+- **`test_priority_rounds_4companies.py`:** 4 companies, 3 seats each, with IBM
+  and Bloomberg given priority. It calls the same `run_priority_match` the real
+  pipeline uses, so it verifies the two round priority behavior end to end.
+
+---
+
+## 4. How the pieces fit together (the data trail)
+
+Follow one student, Alex Chen, through the system:
+
+1. `parse_resumes.py` reads `alexchen@bu.edu.pdf` into text and stores it under
+   `alexchen@bu.edu`.
+2. `load_data.py` reads the student CSV row for `alexchen@bu.edu`, attaches that
+   resume text, and records Alex's ranked choices and sponsorship status.
+3. `score.py` includes Alex in each company's scoring batch and gets back a fit
+   score per company; the sponsorship rule may zero some of those scores.
+4. `match.py` computes Alex's combined score for each company (dropping any
+   companies forbidden by the sponsorship rule), and the Gale-Shapley algorithm
+   assigns Alex to a single company (or the waitlist).
+5. `main.py` writes Alex's row into `matches.csv` and includes Alex in the
+   summary counts.
+
+Everything is tied together by one identifier, the **BU Email**, which is why so
+much care is taken to normalize it consistently across the resume filenames and
+the CSV.
+
+---
+
+## 5. The three or four sentences to say out loud
+
+"The pipeline reads each resume PDF and the two Google Form CSVs, keyed on the
+student's BU email. For every company it sends the students to the Gemini AI in
+batches to score them 0 to 100 on fit, then applies the work authorization rule
+in code: sponsorship mismatches are zeroed and, more importantly, excluded from
+matching entirely so they can never be assigned. It blends each fit score with
+the student's stated preference into a combined score, and runs the
+company-proposing Gale-Shapley algorithm with a capacity per company to produce
+a stable assignment, plus a waitlist. Scores are cached so re-runs cost nothing,
+and an optional priority mode lets chosen companies pick first by matching in an
+earlier round."

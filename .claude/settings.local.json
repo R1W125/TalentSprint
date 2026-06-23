@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -)",
+      "Bash(cd /Users/riwazshrestha/Desktop/talentsprint *)",
+      "Bash(python3 -m pip install -q pandas pdfplumber python-dotenv google-genai)",
+      "Bash(python3 -c \"import pandas, pdfplumber, dotenv; from google import genai; print\\('imports OK'\\)\")",
+      "Bash(python3 -c \"import pandas as pd; pd.set_option\\('display.width',200\\); pd.set_option\\('display.max_colwidth',45\\); print\\(pd.read_csv\\('output/matches.csv'\\).to_string\\(index=False\\)\\)\")",
+      "Bash(python3 -c \"import pandas as pd; df=pd.read_csv\\('output/waitlist.csv'\\); print\\('\\(empty\\)' if df.empty else df.to_string\\(index=False\\)\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -m py_compile config.py parse_resumes.py load_data.py score.py match.py main.py)"
+    ]
+  }
+}

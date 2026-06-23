@@ -1,0 +1,23 @@
+# Secrets: never commit API keys
+.env
+*.env
+
+# Resume PDFs (student data, not for version control)
+resumes/
+*.pdf
+
+# Generated outputs
+output/
+
+# Data files (student and company CSVs)
+*.csv
+
+# Python cruft
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS cruft
+.DS_Store
