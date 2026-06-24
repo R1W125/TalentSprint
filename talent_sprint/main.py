@@ -19,6 +19,8 @@ from load_data import (
     load_students,
     load_companies,
     validate_and_report,
+    filter_by_graduation,
+    filter_by_sponsorship,
 )
 from score import score_all
 from match import run_priority_match
@@ -52,8 +54,22 @@ def _write_waitlist(waitlist):
     return df
 
 
-def _print_summary(students, companies, matches, waitlist, missing_resume, scores_df):
-    total = len(students)
+def _print_summary(
+    students,
+    companies,
+    matches,
+    waitlist,
+    missing_resume,
+    scores_df,
+    students_loaded=None,
+    excluded_grad=None,
+    excluded_sponsor=None,
+):
+    excluded_grad = excluded_grad or []
+    excluded_sponsor = excluded_sponsor or []
+    eligible = len(students)  # the pool that was scored and matched
+    if students_loaded is None:
+        students_loaded = eligible + len(excluded_grad) + len(excluded_sponsor)
     matched = len(matches)
     wl = len(waitlist)
 
@@ -61,9 +77,15 @@ def _print_summary(students, companies, matches, waitlist, missing_resume, score
     print("=" * 70)
     print("TALENT SPRINT SUMMARY REPORT")
     print("=" * 70)
-    print(f"Total students:    {total}")
-    print(f"Total matched:     {matched}")
-    print(f"Total waitlisted:  {wl}")
+
+    # Stage by stage funnel: registered -> excluded -> eligible -> matched/waitlist.
+    print("STUDENT FUNNEL")
+    print(f"  Registered (loaded):            {students_loaded}")
+    print(f"  Excluded, graduation year:      {len(excluded_grad)}")
+    print(f"  Excluded, work authorization:   {len(excluded_sponsor)}")
+    print(f"  Eligible (scored and matched):  {eligible}")
+    print(f"  Matched:                        {matched}")
+    print(f"  Waitlisted:                     {wl}")
 
     # Per company: slots filled and average fit score of matched students.
     print("\nPER COMPANY (slots filled / capacity, average fit of matched):")
@@ -103,18 +125,31 @@ def _print_summary(students, companies, matches, waitlist, missing_resume, score
     for label in ["1st", "2nd", "3rd", "lower (4+)", "unranked"]:
         print(f"  {label:12} {buckets[label]}")
 
-    # Students filtered to 0 by the sponsorship hard filter.
+    # Excluded BEFORE scoring, by stage.
+    print(f"\nEXCLUDED BEFORE SCORING - GRADUATION YEAR: {len(excluded_grad)}")
+    for ex in excluded_grad:
+        print(f"  {ex['email']:25} grad={ex['graduation_date']!r:8} ({ex['reason']})")
+
+    print(f"\nEXCLUDED BEFORE SCORING - WORK AUTHORIZATION: {len(excluded_sponsor)}")
+    for ex in excluded_sponsor:
+        print(f"  {ex['email']:25} ({ex['reason']})")
+
+    # Per-pair sponsorship hard filter at match time. Only relevant when the
+    # work authorization exclusion above is off and such students remain in play.
+    in_play = set(students["email"])
     filtered = scores_df[
         scores_df["reasoning"].astype(str).str.startswith("Hard filter:")
+        & scores_df["student_email"].isin(in_play)
     ]
     filtered_students = sorted(set(filtered["student_email"]))
-    print(f"\nSTUDENTS HIT BY THE SPONSORSHIP HARD FILTER: {len(filtered_students)}")
-    for e in filtered_students:
-        n_companies = len(filtered[filtered["student_email"] == e])
-        print(f"  {e:25} zeroed for {n_companies} non-sponsoring companies")
+    if filtered_students:
+        print(f"\nSTUDENTS HIT BY THE PER-PAIR SPONSORSHIP HARD FILTER: {len(filtered_students)}")
+        for e in filtered_students:
+            n_companies = len(filtered[filtered["student_email"] == e])
+            print(f"  {e:25} zeroed for {n_companies} non-sponsoring companies")
 
-    # Missing resumes.
-    print(f"\nSTUDENTS MISSING RESUMES: {len(missing_resume)}")
+    # Missing resumes (flagged, but NOT excluded; they are still scored/matched).
+    print(f"\nFLAGGED - MISSING RESUMES (still included): {len(missing_resume)}")
     for e in missing_resume:
         print(f"  {e}")
 
@@ -146,6 +181,18 @@ def main():
         resume_texts=resume_texts
     )
     companies = load_companies()
+    students_loaded = len(students)  # original count, before any eligibility filter
+
+    # Eligibility filters, applied BEFORE scoring so ineligible students never
+    # reach the API or the match. Graduation first, then work authorization;
+    # each excluded student is attributed to the first filter that removed them.
+    students, excluded_grad = filter_by_graduation(students)
+    students, excluded_sponsor = filter_by_sponsorship(students)
+
+    # Keep the missing-resume list consistent with who actually remains.
+    kept_emails = set(students["email"])
+    missing_resume = [e for e in missing_resume if e in kept_emails]
+
     validate_and_report(students, companies, missing_resume, choice_company_names)
 
     # 3. Score (or load cache).
@@ -166,7 +213,17 @@ def main():
     print(f"  wrote {config.WAITLIST_CSV}")
 
     # Summary.
-    _print_summary(students, companies, matches, waitlist, missing_resume, scores_df)
+    _print_summary(
+        students,
+        companies,
+        matches,
+        waitlist,
+        missing_resume,
+        scores_df,
+        students_loaded=students_loaded,
+        excluded_grad=excluded_grad,
+        excluded_sponsor=excluded_sponsor,
+    )
 
 
 if __name__ == "__main__":

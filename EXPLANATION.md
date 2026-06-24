@@ -62,8 +62,18 @@ What it defines:
 - **Matching weights and capacity:** `FIT_WEIGHT = 0.7`, `PREFERENCE_WEIGHT =
   0.3`, `SLOTS_PER_COMPANY = 10`.
 - **`PRIORITY_COMPANIES`:** an optional list of companies that get first pick
-  (explained under `match.py`). Currently set to `["IBM", "Enlaye"]`. An empty
-  list `[]` means all companies are treated equally.
+  (explained under `match.py`). An empty list `[]` means all companies are
+  treated equally.
+- **`ALLOWED_GRADUATION_YEARS`:** an optional list of graduation years that are
+  allowed to take part (the event is for juniors and seniors only). Any student
+  whose graduation year is not in this list is dropped before scoring and
+  matching. An empty list `[]` disables the filter and includes everyone.
+  Example for a 2026 event: `[2026, 2027, 2028]`. Explained under `load_data.py`.
+- **`EXCLUDE_STUDENTS_NEEDING_SPONSORSHIP`:** when True (the default), students
+  who answered "No" to the work authorization question are treated as ineligible
+  and dropped before scoring, just like the graduation filter. When False, they
+  are kept and only blocked from non-sponsoring companies at match time (the
+  older per-pair hard filter). Explained under `load_data.py` and `match.py`.
 - **`PREFERENCE_SCORE_MAP`:** converts a student's rank into points. Rank 1 =
   100, rank 2 = 85, and so on down to rank 6 = 35. A company a student did not
   rank gets `UNRANKED_PREFERENCE_SCORE = 10`. Higher rank means more points,
@@ -130,7 +140,7 @@ For **companies** it builds columns: name, contact, roles, required skills,
 preferred experience level, job description text, ideal candidate notes, and
 `sponsors` (True if they answered "Yes" to sponsoring work authorization).
 
-Three details worth understanding:
+A few details worth understanding:
 
 1. **The join key is BU Email.** Google also auto-collects an "Email Address"
    field, but we deliberately ignore that one and join on the BU Email the
@@ -148,6 +158,37 @@ Three details worth understanding:
    look up how a student ranked a company (using the fuzzy matching above) and
    return either the points from the preference map or the unranked default of
    10. The matcher calls these.
+
+4. **`filter_by_graduation(students)` (juniors and seniors only).** The event is
+   not open to everyone, so this function drops any student whose graduation
+   year is not in `config.ALLOWED_GRADUATION_YEARS`. A helper, `_parse_grad_year`,
+   pulls the 4 digit year out of whatever the "Graduation Date" cell contains
+   (so "2027", "May 2027", and "05/2027" all read as 2027). If the allow list is
+   empty the filter is off and everyone stays; if it is on, students with a
+   missing or unreadable date are also dropped and reported, since we cannot
+   confirm they are eligible. `main.py` runs this right after loading, before
+   scoring, so an ineligible student never costs an API call and never reaches
+   the match.
+
+5. **`filter_by_sponsorship(students)` (work authorization).** Controlled by
+   `config.EXCLUDE_STUDENTS_NEEDING_SPONSORSHIP`. When on (the default), students
+   who need sponsorship (answered "No" to work authorization) are dropped before
+   scoring, exactly like the graduation filter, so they are never sent to the AI
+   or matched. When off, nobody is dropped here and sponsorship is handled later,
+   per company pair, by the hard filter in `match.py`. `main.py` runs this right
+   after the graduation filter; the two run in sequence and each excluded student
+   is attributed to the first filter that removed them, so the counts never
+   double count someone caught by both.
+
+6. **Duplicate submissions are collapsed (`_dedupe_keep_latest`).** If a student
+   fills the form out more than once (say to correct an answer), the CSV has two
+   rows with the same BU Email. Left alone, that student would be scored twice,
+   counted twice, and matched twice. So both loaders deduplicate as the very
+   first step. Students are deduplicated by BU Email keeping the **latest**
+   submission by Timestamp, so a correction wins over the original. Companies are
+   deduplicated by company name; that export has no Timestamp column, so file
+   order stands in for recency (the later row wins). Blank keys are never merged,
+   and any collapse is reported so it is visible rather than silent.
 
 Finally, `validate_and_report(...)` prints sanity checks: how many students and
 companies loaded, any company in a "Choices [...]" column that has no matching
@@ -193,14 +234,22 @@ Robustness (because AI output is not always clean):
   loudly with a clear message rather than guessing.
 - Every score is clamped into the 0 to 100 range.
 
-**The work authorization HARD FILTER (this part is in code, not in the prompt).**
-After the AI returns its scores, the code checks each pair: if the student needs
-sponsorship and the company does not sponsor, it overwrites that fit score with
-0 and records the reason "Hard filter: requires sponsorship, company does not
-sponsor." This is done in Python on purpose, so it is a guaranteed rule and not
-something the AI might apply inconsistently. Importantly, the matcher also treats
-these pairs as forbidden so they can never be assigned (see `match.py`); zeroing
-the fit score is only the visible, audit-friendly half of the rule.
+**The work authorization rule (this part is in code, not in the prompt).** There
+are two ways this can run, set by `config.EXCLUDE_STUDENTS_NEEDING_SPONSORSHIP`:
+
+- **Default (flag on): exclude before scoring.** Students who need sponsorship
+  are dropped by `filter_by_sponsorship` in `load_data.py` before this file ever
+  runs, so they are simply not scored. Cleanest and cheapest.
+- **Flag off: the per-pair hard filter.** Those students are kept, and after the
+  AI returns its scores this file checks each pair: if the student needs
+  sponsorship and the company does not sponsor, it overwrites that fit score with
+  0 and records the reason "Hard filter: requires sponsorship, company does not
+  sponsor." The matcher then also treats these pairs as forbidden so they can
+  never be assigned (see `match.py`); zeroing the fit score is only the visible,
+  audit-friendly half.
+
+Either way the rule lives in Python, not the prompt, so it is a guaranteed rule
+and not something the AI might apply inconsistently.
 
 **Caching and resuming (this protects your API budget):**
 
@@ -288,16 +337,24 @@ logic itself; it just calls the other files and prints a summary.
 In order, it:
 
 1. Calls `parse_resumes()` to read the PDFs.
-2. Calls `load_students()` and `load_companies()`, then `validate_and_report()`.
+2. Calls `load_students()` and `load_companies()`, applies the eligibility
+   filters `filter_by_graduation()` then `filter_by_sponsorship()` (dropping
+   ineligible students before any cost is incurred), then `validate_and_report()`.
 3. Calls `score_all()` (uses the cache, or calls the AI with `--rescore`).
 4. Calls `run_priority_match()` to produce the matches and waitlist.
 5. Writes `matches.csv` and `waitlist.csv`, then prints the summary report.
 
-The **summary report** shows: total students, total matched, total waitlisted;
-per company how many seats were filled and the average fit of its matched
-students; how many students got their 1st, 2nd, 3rd, lower, or an unranked
-choice; which students were zeroed by the sponsorship rule; which students were
-missing resumes; and a note for any company that did not fill all its seats.
+The **summary report** opens with a STUDENT FUNNEL that shows the count at each
+stage: registered (loaded), excluded by graduation year, excluded by work
+authorization, eligible (scored and matched), matched, and waitlisted, so you
+can see exactly where students dropped out. The two exclusion counts are
+disjoint (a student caught by both is counted once, under whichever filter ran
+first), so the numbers always add up. It then shows: per company how many seats
+were filled and the average fit of its matched students; how many students got
+their 1st, 2nd, 3rd, lower, or an unranked choice; the full list of students
+excluded by graduation year and by work authorization; any students flagged for
+missing resumes (these are still included, not excluded); and a note for any
+company that did not fill all its seats.
 
 Output files it produces in `output/`:
 
@@ -320,7 +377,7 @@ Output files it produces in `output/`:
   folder of PDFs.
 - **`output/`:** the three generated CSV files.
 
-### Test files (in the project root, outside `talent_sprint/`)
+### Test files (in the `Tests/` folder, outside `talent_sprint/`)
 
 These reuse the cached scores and make **no AI calls**. They exist to prove the
 matching logic behaves correctly on small, easy to read setups.
@@ -341,12 +398,16 @@ Follow one student, Alex Chen, through the system:
 1. `parse_resumes.py` reads `alexchen@bu.edu.pdf` into text and stores it under
    `alexchen@bu.edu`.
 2. `load_data.py` reads the student CSV row for `alexchen@bu.edu`, attaches that
-   resume text, and records Alex's ranked choices and sponsorship status.
+   resume text, and records Alex's ranked choices, sponsorship status, and
+   graduation year. The eligibility filters run here: if the graduation filter is
+   on and Alex's year is not allowed, or if Alex needs sponsorship and the work
+   authorization exclusion is on, Alex is dropped and the trail stops.
 3. `score.py` includes Alex in each company's scoring batch and gets back a fit
-   score per company; the sponsorship rule may zero some of those scores.
-4. `match.py` computes Alex's combined score for each company (dropping any
-   companies forbidden by the sponsorship rule), and the Gale-Shapley algorithm
-   assigns Alex to a single company (or the waitlist).
+   score per company.
+4. `match.py` computes Alex's combined score for each company (if the work
+   authorization exclusion is off, any non-sponsoring companies are dropped
+   here), and the Gale-Shapley algorithm assigns Alex to a single company (or
+   the waitlist).
 5. `main.py` writes Alex's row into `matches.csv` and includes Alex in the
    summary counts.
 
@@ -359,12 +420,13 @@ the CSV.
 ## 5. The three or four sentences to say out loud
 
 "The pipeline reads each resume PDF and the two Google Form CSVs, keyed on the
-student's BU email. For every company it sends the students to the Gemini AI in
-batches to score them 0 to 100 on fit, then applies the work authorization rule
-in code: sponsorship mismatches are zeroed and, more importantly, excluded from
-matching entirely so they can never be assigned. It blends each fit score with
-the student's stated preference into a combined score, and runs the
-company-proposing Gale-Shapley algorithm with a capacity per company to produce
-a stable assignment, plus a waitlist. Scores are cached so re-runs cost nothing,
-and an optional priority mode lets chosen companies pick first by matching in an
-earlier round."
+student's BU email. It first applies eligibility filters in code, by graduation
+year and by work authorization, so only eligible students are scored at all. For
+every company it sends the eligible students to the Gemini AI in batches to score
+them 0 to 100 on fit. It blends each fit score with the student's stated
+preference into a combined score, and runs the company-proposing Gale-Shapley
+algorithm with a capacity per company to produce a stable assignment, plus a
+waitlist. The summary reports a funnel showing how many students were registered,
+excluded at each stage, eligible, matched, and waitlisted. Scores are cached so
+re-runs cost nothing, and an optional priority mode lets chosen companies pick
+first by matching in an earlier round."

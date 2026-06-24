@@ -35,6 +35,31 @@ FIT_WEIGHT = 0.6
 PREFERENCE_WEIGHT = 0.4
 SLOTS_PER_COMPANY = 2
 
+# ---------------------------------------------------------------------------
+# Graduation eligibility filter
+# ---------------------------------------------------------------------------
+# The event is for juniors and seniors only. List the graduation YEARS that are
+# allowed; any student whose graduation year is not in this list is dropped
+# before scoring and matching (so we do not even spend API calls on them).
+# Leave the list EMPTY to disable the filter and include everyone.
+# The year is read from the "Graduation Date" column, and we pull the 4 digit
+# year out of whatever format it is in (so "2027", "May 2027", "05/2027" all
+# read as 2027). Students with a missing or unreadable graduation date are
+# excluded when the filter is on, and are reported so you can chase them down.
+# Example for a 2026 event (juniors and seniors graduate 2026 to 2028):
+#   ALLOWED_GRADUATION_YEARS = [2026, 2027, 2028]
+ALLOWED_GRADUATION_YEARS = [2026, 2027,2028]
+
+# ---------------------------------------------------------------------------
+# Work authorization eligibility
+# ---------------------------------------------------------------------------
+# When True, students who answered "No" to the work authorization question (so
+# they would need sponsorship) are treated as ineligible for the event and are
+# dropped BEFORE scoring. They are never sent to the AI and never matched.
+# When False, those students are kept and instead only blocked from
+# non-sponsoring companies at match time (the older per-pair hard filter).
+EXCLUDE_STUDENTS_NEEDING_SPONSORSHIP = True
+
 # Optional priority. Companies listed here match FIRST, in their own round,
 # against the full student pool. Every other company then matches in a second
 # round against only the students still unmatched. This is opt in: leave the
@@ -104,9 +129,11 @@ STUDENTS_PER_SCORING_BATCH = 30
 # Students CSV. The join key for the whole pipeline is BU_EMAIL, not the
 # auto-collected Google "Email Address" column.
 STUDENT_COLS = {
+    "timestamp": "Timestamp",  # used to keep the latest of duplicate submissions
     "auto_email": "Email Address",  # auto-collected by Google, NOT the join key
     "name": "Full Name",
     "bu_email": "BU Email",  # the join key and unique student id
+    "graduation_date": "Graduation Date",  # used by the graduation eligibility filter
     "authorized": (
         "Are you authorized to work in the US? "
         "(Important but need to check if we can ask this)"

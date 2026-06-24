@@ -38,6 +38,68 @@ def _norm_company_key(name):
     return text.strip().lower()
 
 
+def _parse_grad_year(text):
+    """
+    Pull a 4 digit graduation year out of a free text graduation date.
+
+    Handles plain years ("2027") and richer formats ("May 2027", "05/2027",
+    "2027-05-15"). Returns the year as an int, or None if no year is found.
+    """
+    m = re.search(r"(?:19|20)\d{2}", str(text))
+    return int(m.group()) if m else None
+
+
+def _dedupe_keep_latest(raw, key_col, key_normalizer=None, timestamp_col=None, label="rows"):
+    """
+    Collapse rows that share the same key, keeping the latest submission.
+
+    If timestamp_col is present, "latest" is the most recent parseable timestamp.
+    Rows with no timestamp column (or an unparseable timestamp) fall back to file
+    order, where a later row is treated as the more recent submission. Blank keys
+    are never merged (each is treated as unique). Prints a note listing the keys
+    that had duplicates. Returns the deduplicated DataFrame in original order.
+    """
+    if key_col not in raw.columns or len(raw) == 0:
+        return raw
+
+    work = raw.copy()
+
+    # Normalized grouping key. Blank keys get a unique placeholder so distinct
+    # blank rows are not collapsed into one.
+    norm = work[key_col].astype(str)
+    if key_normalizer:
+        norm = norm.apply(key_normalizer)
+    keys = [
+        k if str(k).strip() else f"__blank_{i}"
+        for i, k in zip(range(len(norm)), norm)
+    ]
+    work["_dedup_key"] = keys
+
+    # Order rows so the row to KEEP is last for each key.
+    if timestamp_col and timestamp_col in work.columns:
+        order = pd.to_datetime(work[timestamp_col], errors="coerce")
+        work["_dedup_order"] = order
+        # Stable sort by timestamp ascending; unparseable timestamps sort first
+        # so a row with a real timestamp is preferred. File order breaks ties.
+        work = work.sort_values("_dedup_order", kind="stable", na_position="first")
+
+    # Report which real keys had duplicates (ignore the blank placeholders).
+    real = work[~work["_dedup_key"].astype(str).str.startswith("__blank_")]
+    dup_keys = sorted(set(real["_dedup_key"][real["_dedup_key"].duplicated(keep=False)]))
+
+    deduped = work.drop_duplicates(subset="_dedup_key", keep="last")
+    # Restore original file order and drop the helper columns.
+    helper_cols = [c for c in ["_dedup_key", "_dedup_order"] if c in deduped.columns]
+    deduped = deduped.sort_index().drop(columns=helper_cols).reset_index(drop=True)
+
+    if dup_keys:
+        print(
+            f"NOTE: collapsed duplicate {label} (kept latest submission) for: "
+            f"{', '.join(dup_keys)}"
+        )
+    return deduped
+
+
 def _to_bool_authorized(value):
     """"Yes" means authorized (no sponsorship needed). Anything else is treated
     as needing sponsorship only when it is an explicit "No"; blanks are treated
@@ -80,6 +142,16 @@ def load_companies(path=config.COMPANIES_CSV):
     if first_col != config.COMPANY_NAME_INTERNAL:
         raw = raw.rename(columns={first_col: config.COMPANY_NAME_INTERNAL})
 
+    # Collapse duplicate company submissions, keeping the latest. The companies
+    # export has no Timestamp column, so file order stands in for recency.
+    raw = _dedupe_keep_latest(
+        raw,
+        key_col=config.COMPANY_NAME_INTERNAL,
+        key_normalizer=_norm_company_key,
+        timestamp_col=None,
+        label="companies",
+    )
+
     c = config.COMPANY_COLS
 
     def col(internal):
@@ -120,6 +192,17 @@ def load_students(path=config.STUDENTS_CSV, resume_texts=None):
     resume_texts = resume_texts or {}
     raw = pd.read_csv(path, dtype=str).fillna("")
     s = config.STUDENT_COLS
+
+    # Collapse duplicate submissions by the same student (same BU Email), keeping
+    # the most recent one by Timestamp. This handles a student filling the form
+    # out more than once (for example to correct an answer).
+    raw = _dedupe_keep_latest(
+        raw,
+        key_col=s["bu_email"],
+        key_normalizer=normalize_email,
+        timestamp_col=s.get("timestamp", "Timestamp"),
+        label="student submissions",
+    )
 
     def col(internal):
         header = s[internal]
@@ -165,6 +248,8 @@ def load_students(path=config.STUDENTS_CSV, resume_texts=None):
             "next_role_text": col("next_role_text"),
             "resume_text": resumes_attached,
             "preferences": preferences,
+            "graduation_date": col("graduation_date"),
+            "graduation_year": col("graduation_date").apply(_parse_grad_year),
         }
     )
 
@@ -173,6 +258,82 @@ def load_students(path=config.STUDENTS_CSV, resume_texts=None):
     # The set of company names that appear in the Choices headers, for validation.
     choice_company_names = sorted(set(choices_headers.values()))
     return students, missing_resume, choice_company_names
+
+
+def filter_by_graduation(students):
+    """
+    Drop students whose graduation year is not in config.ALLOWED_GRADUATION_YEARS.
+
+    An empty allowlist disables the filter and keeps everyone (opt in, like the
+    priority feature). When the filter is on, students with a missing or
+    unreadable graduation date are also dropped, since we cannot confirm they
+    are eligible.
+
+    Returns (kept_students, excluded) where excluded is a list of dicts with
+    keys: email, graduation_date, reason.
+    """
+    allowed = set(config.ALLOWED_GRADUATION_YEARS)
+    if not allowed:
+        return students.reset_index(drop=True), []
+
+    keep_flags = []
+    excluded = []
+    for _, student in students.iterrows():
+        year = student["graduation_year"]
+        if year in allowed:
+            keep_flags.append(True)
+            continue
+        keep_flags.append(False)
+        reason = (
+            "missing or unreadable graduation date"
+            if year is None
+            else f"graduation year {year} not in allowed list"
+        )
+        excluded.append(
+            {
+                "email": student["email"],
+                "graduation_date": student["graduation_date"],
+                "reason": reason,
+            }
+        )
+
+    mask = pd.Series(keep_flags, index=students.index)
+    kept = students[mask].reset_index(drop=True)
+    return kept, excluded
+
+
+def filter_by_sponsorship(students):
+    """
+    Drop students who need sponsorship (answered "No" to work authorization).
+
+    Controlled by config.EXCLUDE_STUDENTS_NEEDING_SPONSORSHIP. When that flag is
+    off, this is a no op and everyone is kept (the per-pair hard filter in
+    match.py then handles sponsorship at match time instead). When on, these
+    students are removed before scoring so they never reach the AI or the match.
+
+    Returns (kept_students, excluded) where excluded is a list of dicts with
+    keys: email, reason.
+    """
+    if not config.EXCLUDE_STUDENTS_NEEDING_SPONSORSHIP:
+        return students.reset_index(drop=True), []
+
+    keep_flags = []
+    excluded = []
+    for _, student in students.iterrows():
+        if bool(student["needs_sponsorship"]):
+            keep_flags.append(False)
+            excluded.append(
+                {
+                    "email": student["email"],
+                    "reason": "needs sponsorship (answered No to work authorization)",
+                }
+            )
+        else:
+            keep_flags.append(True)
+
+    mask = pd.Series(keep_flags, index=students.index)
+    kept = students[mask].reset_index(drop=True)
+    return kept, excluded
 
 
 def preference_score(student, company_name):

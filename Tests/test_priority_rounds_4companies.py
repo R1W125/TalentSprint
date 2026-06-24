@@ -24,9 +24,14 @@ import sys
 
 import pandas as pd
 
-# Make the talent_sprint modules importable from this outside-the-folder script.
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "talent_sprint"))
+# Make the talent_sprint modules importable from this script, wherever it lives
+# (project root or a subfolder like Tests/). Walk up until we find talent_sprint/.
+_dir = os.path.dirname(os.path.abspath(__file__))
+for _ in range(5):
+    if os.path.isdir(os.path.join(_dir, "talent_sprint")):
+        break
+    _dir = os.path.dirname(_dir)
+sys.path.insert(0, os.path.join(_dir, "talent_sprint"))
 
 import config  # noqa: E402
 from load_data import load_students, load_companies  # noqa: E402
