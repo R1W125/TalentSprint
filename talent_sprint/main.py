@@ -15,6 +15,7 @@ import pandas as pd
 
 import config
 from parse_resumes import parse_resumes
+from parse_company_docs import parse_company_docs
 from load_data import (
     load_students,
     load_companies,
@@ -24,6 +25,7 @@ from load_data import (
 )
 from score import score_all
 from match import run_priority_match
+from schedule import schedule_interviews
 
 
 def _write_matches(matches):
@@ -31,6 +33,7 @@ def _write_matches(matches):
         "student_name",
         "student_email",
         "matched_company",
+        "time_slot",
         "fit_score",
         "preference_rank",
         "combined_score",
@@ -48,9 +51,24 @@ def _write_waitlist(waitlist):
         "best_company",
         "best_combined_score",
         "best_fit_score",
+        "reason",
     ]
     df = pd.DataFrame(waitlist, columns=cols)
     df.to_csv(config.WAITLIST_CSV, index=False)
+    return df
+
+
+def _write_schedule(matches):
+    """Write the timetable, sorted by company then time slot."""
+    from load_data import slot_minutes
+
+    cols = ["matched_company", "time_slot", "student_name", "student_email", "fit_score"]
+    rows = sorted(
+        matches,
+        key=lambda m: (m["matched_company"], slot_minutes(m.get("time_slot", ""))),
+    )
+    df = pd.DataFrame(rows, columns=cols)
+    df.to_csv(config.SCHEDULE_CSV, index=False)
     return df
 
 
@@ -105,6 +123,23 @@ def _print_summary(
         )
         if filled < config.SLOTS_PER_COMPANY:
             underfilled.append((cname, filled))
+
+    # Interview scheduling outcomes.
+    from load_data import slot_minutes
+
+    no_slot = [w for w in waitlist if w.get("reason") == "no available interview slot"]
+    per_slot = {}
+    for m in matches:
+        per_slot[m.get("time_slot", "?")] = per_slot.get(m.get("time_slot", "?"), 0) + 1
+    print("\nINTERVIEW SCHEDULING:")
+    print(f"  scheduled into a time slot:     {len(matches)}")
+    print(f"  could not be scheduled (no slot): {len(no_slot)}")
+    if per_slot:
+        print("  interviews per time slot:")
+        for slot in sorted(per_slot, key=slot_minutes):
+            print(f"    {slot:10} {per_slot[slot]}")
+    for w in no_slot:
+        print(f"  unscheduled: {w['student_email']:25} (matched to {w['best_company']})")
 
     # Preference outcome distribution.
     buckets = {"1st": 0, "2nd": 0, "3rd": 0, "lower (4+)": 0, "unranked": 0}
@@ -168,19 +203,23 @@ def _print_summary(
 def main():
     rescore = "--rescore" in sys.argv
 
-    # 1. Parse resumes.
-    print("Step 1: parsing resumes...")
+    # 1. Parse resumes and company job description documents.
+    print("Step 1: parsing resumes and company documents...")
     resume_texts, unmatched_resume_files = parse_resumes()
     print(f"  parsed {len(resume_texts)} resume(s).")
     if unmatched_resume_files:
         print(f"  unmatched resume files (name is not a valid email): {unmatched_resume_files}")
+    doc_texts, unmatched_doc_files = parse_company_docs()
+    print(f"  parsed {len(doc_texts)} company document(s).")
+    if unmatched_doc_files:
+        print(f"  unmatched company document files: {unmatched_doc_files}")
 
     # 2. Load data.
     print("\nStep 2: loading data...")
     students, missing_resume, choice_company_names = load_students(
         resume_texts=resume_texts
     )
-    companies = load_companies()
+    companies = load_companies(doc_texts=doc_texts)
     students_loaded = len(students)  # original count, before any eligibility filter
 
     # Eligibility filters, applied BEFORE scoring so ineligible students never
@@ -205,12 +244,24 @@ def main():
         print(f"  priority companies configured: {config.PRIORITY_COMPANIES}")
     matches, waitlist = run_priority_match(students, companies, scores_df)
 
+    # 4b. Schedule each matched student into an interview time slot (greedy by
+    # score). Students who cannot get any available slot move to the waitlist.
+    print("\nStep 4b: scheduling interview times...")
+    matches, unscheduled = schedule_interviews(matches, students)
+    for w in waitlist:
+        w.setdefault("reason", "not matched (no remaining capacity)")
+    waitlist = waitlist + unscheduled
+    waitlist.sort(key=lambda r: r["best_combined_score"], reverse=True)
+    print(f"  scheduled {len(matches)}, could not schedule {len(unscheduled)}")
+
     # 5. Write outputs.
     print("\nStep 5: writing outputs...")
     _write_matches(matches)
     _write_waitlist(waitlist)
+    _write_schedule(matches)
     print(f"  wrote {config.MATCHES_CSV}")
     print(f"  wrote {config.WAITLIST_CSV}")
+    print(f"  wrote {config.SCHEDULE_CSV}")
 
     # Summary.
     _print_summary(

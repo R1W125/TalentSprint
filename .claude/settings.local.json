@@ -8,7 +8,18 @@
       "Bash(python3 -c \"import pandas as pd; pd.set_option\\('display.width',200\\); pd.set_option\\('display.max_colwidth',45\\); print\\(pd.read_csv\\('output/matches.csv'\\).to_string\\(index=False\\)\\)\")",
       "Bash(python3 -c \"import pandas as pd; df=pd.read_csv\\('output/waitlist.csv'\\); print\\('\\(empty\\)' if df.empty else df.to_string\\(index=False\\)\\)\")",
       "Bash(python3 -c ' *)",
-      "Bash(python3 -m py_compile config.py parse_resumes.py load_data.py score.py match.py main.py)"
+      "Bash(python3 -m py_compile config.py parse_resumes.py load_data.py score.py match.py main.py)",
+      "Bash(python3 -m py_compile talent_sprint/*.py)",
+      "Bash(python3 talent_sprint/parse_company_docs.py)",
+      "Bash(python3 Tests/test_waitlist_2companies.py)",
+      "Bash(python3 Tests/test_priority_rounds_4companies.py)",
+      "Bash(python3 -m pip install -q python-docx striprtf)",
+      "Bash(python3 -c \"import docx, striprtf; print\\('both import OK'\\)\")",
+      "Bash(python3 -c \"import docx,striprtf,importlib.metadata as m; print\\('python-docx',m.version\\('python-docx'\\)\\); print\\('striprtf',m.version\\('striprtf'\\)\\)\")",
+      "Bash(mkdir -p __TRACKED_VAR__/fmt)",
+      "Bash(python3 -c \"import sys;sys.path.insert\\(0,'talent_sprint'\\);from parse_resumes import parse_resumes;t,u=parse_resumes\\(\\);print\\('parsed',len\\(t\\),'resumes; unmatched',u\\)\")",
+      "Bash(python3 -c \"import sys;sys.path.insert\\(0,'talent_sprint'\\);from parse_company_docs import parse_company_docs;t,u=parse_company_docs\\(\\);print\\('parsed',len\\(t\\),'docs; empty:',[k for k,v in t.items\\(\\) if not v]\\)\")",
+      "Bash(python3 -c \"import sys;sys.path.insert\\(0,'talent_sprint'\\);from document_text import extract_text;print\\(repr\\(extract_text\\('/tmp/nope.xyz'\\)\\)\\)\")"
     ]
   }
 }

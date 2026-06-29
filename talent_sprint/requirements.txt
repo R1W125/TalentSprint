@@ -2,3 +2,7 @@ pandas==2.2.2
 pdfplumber==0.11.4
 python-dotenv==1.0.1
 google-genai==0.8.0
+python-docx==1.2.0
+striprtf==0.0.32
+# Legacy .doc parsing shells out to a system tool (macOS textutil, or
+# LibreOffice / antiword / catdoc). No Python package is required for it.

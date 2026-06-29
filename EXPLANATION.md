@@ -15,19 +15,23 @@ fixed number of students (10 by default). The program decides who goes where.
 It does this in five steps, run in order by `main.py`:
 
 ```
-   PDFs + 2 CSV files
+   resume files + company docs + 2 CSV files
           |
-   (1) parse_resumes.py   read each resume PDF into plain text
+   (1) parse_resumes.py / parse_company_docs.py
+          |             read each resume and company document into plain text
+          |             (any format: pdf, docx, doc, rtf, pages, txt)
           |
-   (2) load_data.py       turn the CSVs into clean tables, attach resumes
+   (2) load_data.py       turn the CSVs into clean tables, attach resumes and
+          |                job descriptions, filter ineligible students
           |
    (3) score.py           ask Gemini AI to rate each student 0-100 per company
           |                then apply the work authorization rule in code
           |
-   (4) match.py           combine AI scores with student preferences,
-          |                then run the matching algorithm
+   (4) match.py           combine AI scores with student preferences, run the
+          |                matching algorithm, then schedule interview times
           |
-   (5) main.py            write matches.csv + waitlist.csv, print a summary
+   (5) main.py            write matches.csv + waitlist.csv + schedule.csv,
+                          print a summary
 ```
 
 Two ideas drive the whole thing:
@@ -96,32 +100,56 @@ and `load_data.py` handle that quirk so the rest of the code sees clean data.
 
 ---
 
-### `parse_resumes.py`  (PDF to text)
+### `document_text.py`  (turn any document into text)
 
-Job: turn each resume PDF into plain text the AI can read.
+Job: one shared helper, `extract_text(path)`, that reads a document of any
+supported format and returns clean text. Both parsers below route every file
+through it, so resumes and company documents are handled identically.
 
-How it works:
+- **Supported formats:** `pdf` (pdfplumber), `docx` (python-docx, including
+  table cells), `rtf` (striprtf), `txt` (plain read), `doc` (legacy Word, read
+  via a system tool: macOS `textutil`, or LibreOffice / antiword / catdoc), and
+  `pages` (Apple Pages, read from the PDF preview embedded in the bundle).
+- **No OCR:** a scanned, image only PDF has no text layer, so it yields empty
+  text. That is a deliberate limitation.
+- **Light cleaning only:** collapse repeated spaces and blank lines, trim the
+  ends. It does not try to restructure the document.
+- **Never crashes:** an unsupported extension or an unreadable file logs a note
+  and returns an empty string, matching the rest of the pipeline's style.
 
-- It looks in `data/resumes/` and opens every `.pdf` using the `pdfplumber`
-  library, extracting the text from each page.
-- It does **light cleaning only**: collapse repeated spaces and blank lines,
-  trim the ends. It deliberately does not try to restructure the resume, because
-  guessing at layout often makes things worse.
+### `parse_resumes.py`  (resumes to text)
+
+Job: build a dictionary mapping each student's email to their resume text.
+
+- It looks in `data/resumes/` and reads every file whose extension is supported,
+  calling `extract_text` on each. The format does not matter.
 - **Linking resumes to students:** the upload system renames each resume to the
-  student's BU email, for example `alex.chen@bu.edu.pdf`. So the program takes
-  the filename, removes `.pdf`, lowercases it, and treats that as the student's
-  email. This is why **BU Email is the single ID used everywhere**.
-- **Defensive behavior (so one bad file never stops the run):**
-  - If a filename is not a valid email (for example `student1_alex.pdf`), it is
-    logged and added to an `unmatched_resume_files` list instead of crashing.
-  - If a PDF is corrupted and cannot be opened, its text becomes an empty string
-    and the run continues.
+  student's BU email, for example `alex.chen@bu.edu.pdf` (or `.docx`, etc). The
+  program takes the filename, removes the extension, lowercases it, and treats
+  that as the student's email. This is why **BU Email is the single ID used
+  everywhere**, and why the file format is irrelevant.
+- **Defensive behavior:** a filename that is not a valid email is logged and put
+  in `unmatched_resume_files`; a corrupt or unreadable file just becomes empty
+  text and the run continues.
 
 Output: a dictionary mapping `email -> resume_text`, plus the list of unmatched
-files.
+files. Emails are always lowercased and stripped on both sides (filename and
+CSV) so they always match.
 
-Important normalization rule: emails are always lowercased and stripped of
-spaces on both sides (the filename side and the CSV side), so they always match.
+### `parse_company_docs.py`  (company job descriptions to text)
+
+Job: the same idea for companies. Each company's roles and job descriptions live
+in a document in `data/company_docs/` (the companies CSV "supporting documents"
+column is now empty). This builds a dictionary mapping each company to its job
+description text, which `load_data.py` attaches as `jd_text`.
+
+- Reads every supported file in `data/company_docs/` via `extract_text`.
+- **Linking docs to companies** is by company name, using the same normalization
+  as everywhere (drops parentheses, lowercases), plus it strips a trailing
+  "(1)" style duplicate suffix and applies a small alias map in config (for
+  example the document "Klaviyo" maps to the form's spelling "Klavio").
+- A company with no matching document falls back to the CSV column and is named
+  in a printed warning.
 
 ---
 
@@ -329,6 +357,29 @@ so the feature is fully opt in and the default behavior is unchanged.
 
 ---
 
+### `schedule.py`  (assign interview time slots)
+
+Job: run after matching, to give each matched student an actual interview time.
+Students pick the times they are available on the form (for example "3:00 pm,
+3:15 pm, ..."), parsed into each student's record by `load_data.py`.
+
+The key insight: since each student is matched to exactly one company, each has
+exactly one interview, so a student can never have a time conflict across
+companies. The only conflict is **within** a company: two of its students
+wanting the same slot. A company runs one interview per slot, so the number of
+distinct time slots is the real ceiling on its interviews.
+
+The rule is **greedy by score**: for each company, sort its matched students by
+fit score (highest first); each takes the earliest slot they marked available
+that is not already taken at that company. So a contested slot goes to the higher
+scored student. A student who cannot get any available slot is **unscheduled**
+and moved to the waitlist with the reason "no available interview slot".
+
+Output: each matched student gains a `time_slot`, written to `matches.csv` and to
+a clean per-company timetable, `schedule.csv`.
+
+---
+
 ### `main.py`  (the conductor)
 
 Job: run the five steps in order and report the results. It contains no matching
@@ -336,13 +387,16 @@ logic itself; it just calls the other files and prints a summary.
 
 In order, it:
 
-1. Calls `parse_resumes()` to read the PDFs.
-2. Calls `load_students()` and `load_companies()`, applies the eligibility
-   filters `filter_by_graduation()` then `filter_by_sponsorship()` (dropping
-   ineligible students before any cost is incurred), then `validate_and_report()`.
+1. Calls `parse_resumes()` and `parse_company_docs()` to read all the documents.
+2. Calls `load_students()` and `load_companies()` (attaching job descriptions),
+   applies the eligibility filters `filter_by_graduation()` then
+   `filter_by_sponsorship()` (dropping ineligible students before any cost is
+   incurred), then `validate_and_report()`.
 3. Calls `score_all()` (uses the cache, or calls the AI with `--rescore`).
-4. Calls `run_priority_match()` to produce the matches and waitlist.
-5. Writes `matches.csv` and `waitlist.csv`, then prints the summary report.
+4. Calls `run_priority_match()` to produce the matches and waitlist, then
+   `schedule_interviews()` to assign each matched student a time slot.
+5. Writes `matches.csv`, `waitlist.csv`, and `schedule.csv`, then prints the
+   summary report.
 
 The **summary report** opens with a STUDENT FUNNEL that shows the count at each
 stage: registered (loaded), excluded by graduation year, excluded by work
@@ -359,10 +413,12 @@ company that did not fill all its seats.
 Output files it produces in `output/`:
 
 - **`matches.csv`:** the final answer. One row per matched student with their
-  company, fit score, the rank they gave that company, the combined score, and
-  the AI's one line reason.
-- **`waitlist.csv`:** unmatched students with their best near-miss company and
-  scores.
+  company, assigned time slot, fit score, the rank they gave that company, the
+  combined score, and the AI's one line reason.
+- **`waitlist.csv`:** unmatched students with their best near-miss company,
+  scores, and a reason (capacity, or "no available interview slot").
+- **`schedule.csv`:** the timetable, one row per interview, sorted by company
+  then time slot.
 - **`scores.csv`:** the full AI score sheet (also the cache).
 
 ---
@@ -372,10 +428,11 @@ Output files it produces in `output/`:
 - **`.env`:** holds your secret `GEMINI_API_KEY` and the `GEMINI_MODEL` name.
   Kept out of the code so the key is not hard coded.
 - **`requirements.txt`:** the list of Python libraries to install
-  (`pandas`, `pdfplumber`, `python-dotenv`, `google-genai`).
-- **`data/`:** inputs. `students.csv`, `companies.csv`, and the `resumes/`
-  folder of PDFs.
-- **`output/`:** the three generated CSV files.
+  (`pandas`, `pdfplumber`, `python-dotenv`, `google-genai`, `python-docx`,
+  `striprtf`). Legacy `.doc` files use a system tool, not a Python package.
+- **`data/`:** inputs. `students.csv`, `companies.csv`, the `resumes/` folder,
+  and the `company_docs/` folder (both accept any supported document format).
+- **`output/`:** the generated CSV files (matches, waitlist, schedule, scores).
 
 ### Test files (in the `Tests/` folder, outside `talent_sprint/`)
 

@@ -18,6 +18,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 RESUMES_DIR = os.path.join(DATA_DIR, "resumes")
+COMPANY_DOCS_DIR = os.path.join(DATA_DIR, "company_docs")  # per-company JD PDFs
 
 STUDENTS_CSV = os.path.join(DATA_DIR, "students.csv")
 COMPANIES_CSV = os.path.join(DATA_DIR, "companies.csv")
@@ -25,6 +26,7 @@ COMPANIES_CSV = os.path.join(DATA_DIR, "companies.csv")
 SCORES_CSV = os.path.join(OUTPUT_DIR, "scores.csv")
 MATCHES_CSV = os.path.join(OUTPUT_DIR, "matches.csv")
 WAITLIST_CSV = os.path.join(OUTPUT_DIR, "waitlist.csv")
+SCHEDULE_CSV = os.path.join(OUTPUT_DIR, "schedule.csv")  # company x time slot timetable
 
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 
@@ -151,6 +153,7 @@ STUDENT_COLS = {
         "(short paragraph)"
     ),
     "resume_link": "Resume",  # a link string, ignored; real PDFs live in resumes/
+    "availability": "Please choose all the times you are available",  # comma separated slots
 }
 
 # Prefix of the per-company preference columns, e.g. "Choices [IBM]".
@@ -162,6 +165,14 @@ CHOICES_SUFFIX = "]"
 # "Company Name"). load_data renames the first column to COMPANY_NAME_INTERNAL
 # by position, so the mapping below uses that internal name for the company
 # name and the exact header strings for everything else.
+# Known spelling differences between a company document filename and the company
+# name used in the CSVs and student Choices columns. Map "document spelling" to
+# "CSV spelling". Matching is case and punctuation insensitive. Example: the JD
+# PDF is named "Klaviyo" but the forms spell the company "Klavio".
+COMPANY_NAME_ALIASES = {
+    "Klaviyo": "Klavio",
+}
+
 COMPANY_NAME_INTERNAL = "Company Name"
 COMPANY_COLS = {
     "name": COMPANY_NAME_INTERNAL,  # forced onto column 0 by load_data

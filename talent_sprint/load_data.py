@@ -100,6 +100,42 @@ def _dedupe_keep_latest(raw, key_col, key_normalizer=None, timestamp_col=None, l
     return deduped
 
 
+def slot_minutes(slot):
+    """
+    Sort key for a time slot like "3:15 pm": minutes since midnight.
+
+    Returns a large number for anything unparseable so it sorts last.
+    """
+    m = re.match(r"\s*(\d{1,2}):(\d{2})\s*([ap]m)\s*$", str(slot).lower())
+    if not m:
+        return 10**9
+    hour, minute, ampm = int(m.group(1)), int(m.group(2)), m.group(3)
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+    return hour * 60 + minute
+
+
+def _parse_availability(text):
+    """
+    Parse the comma separated availability cell into an ordered list of
+    normalized time slots (earliest first). Unparseable tokens are dropped.
+    """
+    slots = []
+    for token in str(text).split(","):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if re.match(r"^\d{1,2}:\d{2}\s*[ap]m$", token):
+            # Normalize internal spacing, for example "3:15  pm" -> "3:15 pm".
+            token = re.sub(r"\s+", " ", token)
+            if token not in slots:
+                slots.append(token)
+    slots.sort(key=slot_minutes)
+    return slots
+
+
 def _to_bool_authorized(value):
     """"Yes" means authorized (no sponsorship needed). Anything else is treated
     as needing sponsorship only when it is an explicit "No"; blanks are treated
@@ -133,8 +169,15 @@ def _parse_choices(row, choices_headers):
     return ranks
 
 
-def load_companies(path=config.COMPANIES_CSV):
-    """Load the companies CSV into a clean DataFrame."""
+def load_companies(path=config.COMPANIES_CSV, doc_texts=None):
+    """
+    Load the companies CSV into a clean DataFrame.
+
+    doc_texts, when provided, is the dict from parse_company_docs (normalized
+    company key -> job description text). Each company's jd_text is taken from
+    its matching document; if a company has no document, it falls back to the
+    CSV column (now usually empty) and is collected in a printed warning.
+    """
     raw = pd.read_csv(path, dtype=str).fillna("")
 
     # Force the first column (mislabeled in the export) to a known label.
@@ -178,6 +221,26 @@ def load_companies(path=config.COMPANIES_CSV):
     # Drop any fully blank company-name rows defensively.
     companies = companies[companies["name"].str.strip() != ""].reset_index(drop=True)
     companies["name_key"] = companies["name"].apply(_norm_company_key)
+
+    # Attach job descriptions from the parsed company documents, keyed by the
+    # normalized company name. Fall back to the CSV column when no doc matched.
+    if doc_texts is not None:
+        missing_docs = []
+        jd = []
+        for _, comp in companies.iterrows():
+            text = doc_texts.get(comp["name_key"], "")
+            if not text:
+                text = comp["jd_text"]  # CSV fallback (usually empty now)
+                if not str(text).strip():
+                    missing_docs.append(comp["name"])
+            jd.append(text)
+        companies["jd_text"] = jd
+        if missing_docs:
+            print(
+                "WARNING: no job description document found for: "
+                + ", ".join(missing_docs)
+            )
+
     return companies
 
 
@@ -250,6 +313,7 @@ def load_students(path=config.STUDENTS_CSV, resume_texts=None):
             "preferences": preferences,
             "graduation_date": col("graduation_date"),
             "graduation_year": col("graduation_date").apply(_parse_grad_year),
+            "availability": col("availability").apply(_parse_availability),
         }
     )
 
@@ -280,15 +344,17 @@ def filter_by_graduation(students):
     excluded = []
     for _, student in students.iterrows():
         year = student["graduation_year"]
-        if year in allowed:
+        # pandas may store the year column as float (a None promotes ints to
+        # floats), so detect missing with isna and compare as an int.
+        if pd.isna(year):
+            keep_flags.append(False)
+            reason = "missing or unreadable graduation date"
+        elif int(year) in allowed:
             keep_flags.append(True)
             continue
-        keep_flags.append(False)
-        reason = (
-            "missing or unreadable graduation date"
-            if year is None
-            else f"graduation year {year} not in allowed list"
-        )
+        else:
+            keep_flags.append(False)
+            reason = f"graduation year {int(year)} not in allowed list"
         excluded.append(
             {
                 "email": student["email"],
